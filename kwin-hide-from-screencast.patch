@@ -1,0 +1,455 @@
+diff --git a/src/options.h b/src/options.h
+index f7f63e2..592b05b 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -438,6 +438,7 @@ public:
+         LowerOp,
+         FullScreenOp,
+         NoBorderOp,
++        ExcludeFromCaptureOp,
+         NoOp,
+         SetupWindowShortcutOp,
+         ApplicationRulesOp,
+diff --git a/src/plugins/screencast/outputscreencastsource.cpp b/src/plugins/screencast/outputscreencastsource.cpp
+index d31a8f6..e89105f 100644
+--- a/src/plugins/screencast/outputscreencastsource.cpp
++++ b/src/plugins/screencast/outputscreencastsource.cpp
+@@ -10,10 +10,17 @@
+ #include "compositor.h"
+ #include "core/output.h"
+ #include "core/renderloop.h"
++#include "core/rendertarget.h"
++#include "core/renderviewport.h"
+ #include "cursor.h"
++#include "effect/effect.h"
+ #include "opengl/gltexture.h"
+ #include "opengl/glutils.h"
++#include "scene/itemrenderer.h"
++#include "scene/windowitem.h"
+ #include "scene/workspacescene.h"
++#include "window.h"
++#include "workspace.h"
+ 
+ #include <drm_fourcc.h>
+ 
+@@ -54,29 +61,106 @@ qreal OutputScreenCastSource::devicePixelRatio() const
+ 
+ void OutputScreenCastSource::render(QImage *target)
+ {
+-    const auto [outputTexture, colorDescription] = Compositor::self()->scene()->textureForOutput(m_output);
+-    if (outputTexture) {
+-        grabTexture(outputTexture.get(), target);
++    // Check if any window is excluded from capture
++    bool hasExcludedWindows = false;
++    const auto windows = workspace()->windows();
++    for (const auto &window : windows) {
++        if (window->excludeFromCapture() && window->isOnOutput(m_output) && window->isShown()) {
++            hasExcludedWindows = true;
++            break;
++        }
++    }
++
++    if (!hasExcludedWindows) {
++        // Fast path: use existing output texture
++        const auto [outputTexture, colorDescription] = Compositor::self()->scene()->textureForOutput(m_output);
++        if (outputTexture) {
++            grabTexture(outputTexture.get(), target);
++        }
++        return;
++    }
++
++    // Slow path: render custom scene without excluded windows
++    const auto offscreenTexture = GLTexture::allocate(GL_RGBA8, target->size());
++    if (!offscreenTexture) {
++        return;
+     }
++    offscreenTexture->setContentTransform(OutputTransform::FlipY);
++
++    GLFramebuffer offscreenTarget(offscreenTexture.get());
++    renderFiltered(&offscreenTarget);
++    grabTexture(offscreenTexture.get(), target);
+ }
+ 
+ void OutputScreenCastSource::render(GLFramebuffer *target)
+ {
+-    const auto [outputTexture, colorDescription] = Compositor::self()->scene()->textureForOutput(m_output);
+-    if (!outputTexture) {
++    // Check if any window is excluded from capture
++    bool hasExcludedWindows = false;
++    const auto windows = workspace()->windows();
++    for (const auto &window : windows) {
++        if (window->excludeFromCapture() && window->isOnOutput(m_output) && window->isShown()) {
++            hasExcludedWindows = true;
++            break;
++        }
++    }
++
++    if (!hasExcludedWindows) {
++        // Fast path: use existing output texture
++        const auto [outputTexture, colorDescription] = Compositor::self()->scene()->textureForOutput(m_output);
++        if (!outputTexture) {
++            return;
++        }
++
++        ShaderBinder shaderBinder(ShaderTrait::MapTexture | ShaderTrait::TransformColorspace);
++        QMatrix4x4 projectionMatrix;
++        projectionMatrix.scale(1, -1);
++        projectionMatrix.ortho(QRect(QPoint(), textureSize()));
++        shaderBinder.shader()->setUniform(GLShader::Mat4Uniform::ModelViewProjectionMatrix, projectionMatrix);
++        shaderBinder.shader()->setColorspaceUniforms(colorDescription, ColorDescription::sRGB, RenderingIntent::RelativeColorimetricWithBPC);
++
++        GLFramebuffer::pushFramebuffer(target);
++        outputTexture->render(textureSize());
++        GLFramebuffer::popFramebuffer();
+         return;
+     }
+ 
+-    ShaderBinder shaderBinder(ShaderTrait::MapTexture | ShaderTrait::TransformColorspace);
+-    QMatrix4x4 projectionMatrix;
+-    projectionMatrix.scale(1, -1);
+-    projectionMatrix.ortho(QRect(QPoint(), textureSize()));
+-    shaderBinder.shader()->setUniform(GLShader::Mat4Uniform::ModelViewProjectionMatrix, projectionMatrix);
+-    shaderBinder.shader()->setColorspaceUniforms(colorDescription, ColorDescription::sRGB, RenderingIntent::RelativeColorimetricWithBPC);
++    // Slow path: render filtered scene
++    renderFiltered(target);
++}
++
++void OutputScreenCastSource::renderFiltered(GLFramebuffer *target)
++{
++    RenderTarget renderTarget(target);
++    RenderViewport viewport(m_output->geometryF(), m_output->scale(), renderTarget);
++
++    auto renderer = Compositor::self()->scene()->renderer();
++    renderer->beginFrame(renderTarget, viewport);
++
++    // Clear with black background
++    glClearColor(0.0, 0.0, 0.0, 1.0);
++    glClear(GL_COLOR_BUFFER_BIT);
++
++    // Get stacking order and render each window individually
++    const auto &stackingOrder = workspace()->stackingOrder();
++    for (const auto &window : stackingOrder) {
++        if (!window->isOnOutput(m_output)) {
++            continue;
++        }
++        if (!window->isShown()) {
++            continue;
++        }
++        if (window->excludeFromCapture()) {
++            continue; // Skip excluded windows
++        }
++
++        WindowItem *windowItem = window->windowItem();
++        if (windowItem && windowItem->isVisible()) {
++            renderer->renderItem(renderTarget, viewport, windowItem, 
++                Scene::PAINT_WINDOW_TRANSFORMED, infiniteRegion(), WindowPaintData{});
++        }
++    }
+ 
+-    GLFramebuffer::pushFramebuffer(target);
+-    outputTexture->render(textureSize());
+-    GLFramebuffer::popFramebuffer();
++    renderer->endFrame();
+ }
+ 
+ std::chrono::nanoseconds OutputScreenCastSource::clock() const
+diff --git a/src/plugins/screencast/outputscreencastsource.h b/src/plugins/screencast/outputscreencastsource.h
+index 4c4a668..bf9698a 100644
+--- a/src/plugins/screencast/outputscreencastsource.h
++++ b/src/plugins/screencast/outputscreencastsource.h
+@@ -42,6 +42,7 @@ public:
+ 
+ private:
+     void report(const QRegion &damage);
++    void renderFiltered(GLFramebuffer *target);
+ 
+     QPointer<Output> m_output;
+     bool m_active = false;
+diff --git a/src/plugins/screencast/regionscreencastsource.cpp b/src/plugins/screencast/regionscreencastsource.cpp
+index b641b1c..5e2e7c6 100644
+--- a/src/plugins/screencast/regionscreencastsource.cpp
++++ b/src/plugins/screencast/regionscreencastsource.cpp
+@@ -7,15 +7,23 @@
+ #include "regionscreencastsource.h"
+ #include "screencastutils.h"
+ 
++#include "compositor.h"
++#include "core/output.h"
+ #include "core/pixelgrid.h"
++#include "core/renderloop.h"
++#include "core/rendertarget.h"
++#include "core/renderviewport.h"
+ #include "cursor.h"
++#include "effect/effect.h"
+ #include "opengl/gltexture.h"
+ #include "opengl/glutils.h"
+-#include <compositor.h>
+-#include <core/output.h>
++#include "scene/itemrenderer.h"
++#include "scene/windowitem.h"
++#include "scene/workspacescene.h"
++#include "window.h"
++#include "workspace.h"
++
+ #include <drm_fourcc.h>
+-#include <scene/workspacescene.h>
+-#include <workspace.h>
+ 
+ #include <QPainter>
+ 
+@@ -92,7 +100,22 @@ void RegionScreenCastSource::blit(Output *output)
+ {
+     m_last = output->renderLoop()->lastPresentationTimestamp();
+ 
+-    if (m_renderedTexture) {
++    if (!m_renderedTexture) {
++        return;
++    }
++
++    // Check if any window on this output is excluded from capture
++    bool hasExcludedWindows = false;
++    const auto windows = workspace()->windows();
++    for (const auto &window : windows) {
++        if (window->excludeFromCapture() && window->isOnOutput(output) && window->isShown()) {
++            hasExcludedWindows = true;
++            break;
++        }
++    }
++
++    if (!hasExcludedWindows) {
++        // Fast path: use existing output texture
+         const auto [outputTexture, colorDescription] = Compositor::self()->scene()->textureForOutput(output);
+         const auto outputGeometry = snapToPixelGridF(scaledRect(output->geometryF(), m_scale));
+         if (!outputTexture) {
+@@ -112,7 +135,42 @@ void RegionScreenCastSource::blit(Output *output)
+ 
+         outputTexture->render(outputGeometry.size());
+         GLFramebuffer::popFramebuffer();
++        return;
++    }
++
++    // Slow path: render filtered scene for this output region
++    GLFramebuffer::pushFramebuffer(m_target.get());
++
++    RenderTarget renderTarget(m_target.get());
++    RenderViewport viewport(output->geometryF(), m_scale, renderTarget);
++
++    auto renderer = Compositor::self()->scene()->renderer();
++    // Note: We don't call beginFrame/endFrame here as we're just adding to existing buffer
++
++    // Render each visible window that's not excluded
++    const auto &stackingOrder = workspace()->stackingOrder();
++    for (const auto &window : stackingOrder) {
++        if (!window->isOnOutput(output)) {
++            continue;
++        }
++        if (!window->isShown()) {
++            continue;
++        }
++        if (window->excludeFromCapture()) {
++            continue; // Skip excluded windows
++        }
++
++        WindowItem *windowItem = window->windowItem();
++        if (windowItem && windowItem->isVisible()) {
++            const QRectF windowGeom = window->frameGeometry();
++            if (windowGeom.intersects(m_region)) {
++                renderer->renderItem(renderTarget, viewport, windowItem,
++                    Scene::PAINT_WINDOW_TRANSFORMED, infiniteRegion(), WindowPaintData{});
++            }
++        }
+     }
++
++    GLFramebuffer::popFramebuffer();
+ }
+ 
+ void RegionScreenCastSource::ensureTexture()
+diff --git a/src/scripting/workspace_wrapper.cpp b/src/scripting/workspace_wrapper.cpp
+index 092d2c4..43c8e0d 100644
+--- a/src/scripting/workspace_wrapper.cpp
++++ b/src/scripting/workspace_wrapper.cpp
+@@ -155,6 +155,7 @@ SLOTWRAPPER(slotWindowBelow)
+ SLOTWRAPPER(slotWindowOnAllDesktops)
+ SLOTWRAPPER(slotWindowFullScreen)
+ SLOTWRAPPER(slotWindowNoBorder)
++SLOTWRAPPER(slotWindowExcludeFromCapture)
+ 
+ SLOTWRAPPER(slotWindowToNextDesktop)
+ SLOTWRAPPER(slotWindowToPreviousDesktop)
+diff --git a/src/scripting/workspace_wrapper.h b/src/scripting/workspace_wrapper.h
+index 7b7bfb2..ce52e91 100644
+--- a/src/scripting/workspace_wrapper.h
++++ b/src/scripting/workspace_wrapper.h
+@@ -363,6 +363,7 @@ public Q_SLOTS:
+     void slotWindowOnAllDesktops();
+     void slotWindowFullScreen();
+     void slotWindowNoBorder();
++    void slotWindowExcludeFromCapture();
+ 
+     void slotWindowToNextDesktop();
+     void slotWindowToPreviousDesktop();
+diff --git a/src/useractions.cpp b/src/useractions.cpp
+index 54a8f45..400e4b8 100644
+--- a/src/useractions.cpp
++++ b/src/useractions.cpp
+@@ -88,6 +88,7 @@ UserActionsMenu::UserActionsMenu(QObject *parent)
+     , m_minimizeOperation(nullptr)
+     , m_closeOperation(nullptr)
+     , m_shortcutOperation(nullptr)
++    , m_excludeFromCapture(nullptr)
+ {
+ }
+ 
+@@ -253,6 +254,12 @@ void UserActionsMenu::init()
+     m_noBorderOperation->setCheckable(true);
+     m_noBorderOperation->setData(Options::NoBorderOp);
+ 
++    m_excludeFromCapture = advancedMenu->addAction(i18n("&Hide from Screencast"));
++    m_excludeFromCapture->setIcon(QIcon::fromTheme(QStringLiteral("view-private")));
++    setShortcut(m_excludeFromCapture, QStringLiteral("Window Exclude From Capture"));
++    m_excludeFromCapture->setCheckable(true);
++    m_excludeFromCapture->setData(Options::ExcludeFromCaptureOp);
++
+     advancedMenu->addSeparator();
+ 
+     m_shortcutOperation = advancedMenu->addAction(i18n("Set Window Short&cut…"));
+@@ -342,6 +349,7 @@ void UserActionsMenu::menuAboutToShow()
+     m_fullScreenOperation->setChecked(m_window->isFullScreen());
+     m_noBorderOperation->setEnabled(m_window->userCanSetNoBorder());
+     m_noBorderOperation->setChecked(m_window->noBorder());
++    m_excludeFromCapture->setChecked(m_window->excludeFromCapture());
+     m_minimizeOperation->setEnabled(m_window->isMinimizable());
+     m_closeOperation->setEnabled(m_window->isCloseable());
+     m_shortcutOperation->setEnabled(m_window->rules()->checkShortcut(QString()).isNull());
+@@ -1212,6 +1220,9 @@ void Workspace::performWindowOperation(Window *window, Options::WindowOperation
+             window->setNoBorder(!window->noBorder());
+         }
+         break;
++    case Options::ExcludeFromCaptureOp:
++        window->setExcludeFromCapture(!window->excludeFromCapture());
++        break;
+     case Options::KeepAboveOp: {
+         StackingUpdatesBlocker blocker(this);
+         bool was = window->keepAbove();
+@@ -1464,6 +1475,13 @@ void Workspace::slotWindowNoBorder()
+     }
+ }
+ 
++void Workspace::slotWindowExcludeFromCapture()
++{
++    if (USABLE_ACTIVE_WINDOW) {
++        performWindowOperation(m_activeWindow, Options::ExcludeFromCaptureOp);
++    }
++}
++
+ void Workspace::slotWindowAbove()
+ {
+     if (USABLE_ACTIVE_WINDOW) {
+diff --git a/src/useractions.h b/src/useractions.h
+index 84877aa..5e304de 100644
+--- a/src/useractions.h
++++ b/src/useractions.h
+@@ -202,6 +202,7 @@ private:
+     QAction *m_minimizeOperation;
+     QAction *m_closeOperation;
+     QAction *m_shortcutOperation;
++    QAction *m_excludeFromCapture;
+     /**
+      * The window for which the menu is shown.
+      */
+diff --git a/src/window.cpp b/src/window.cpp
+index 9ae4354..b4d4bc6 100644
+--- a/src/window.cpp
++++ b/src/window.cpp
+@@ -2330,6 +2330,9 @@ void Window::setTransientFor(Window *transientFor)
+         return;
+     }
+     m_transientFor = transientFor;
++    if (m_transientFor) {
++        setExcludeFromCapture(m_transientFor->excludeFromCapture());
++    }
+     Q_EMIT transientChanged();
+ }
+ 
+@@ -4774,6 +4777,26 @@ void Window::updatePreferredColorDescription()
+     setPreferredColorDescription(m_moveResizeOutput->colorDescription());
+ }
+ 
++bool Window::excludeFromCapture() const
++{
++    return m_excludeFromCapture;
++}
++
++void Window::setExcludeFromCapture(bool newExcludeFromCapture)
++{
++    if (m_excludeFromCapture == newExcludeFromCapture) {
++        return;
++    }
++
++    m_excludeFromCapture = newExcludeFromCapture;
++
++    for (auto window : std::as_const(m_transients)) {
++        window->setExcludeFromCapture(newExcludeFromCapture);
++    }
++
++    Q_EMIT excludeFromCaptureChanged();
++}
++
+ } // namespace KWin
+ 
+ #include "moc_window.cpp"
+diff --git a/src/window.h b/src/window.h
+index 6d56304..9ce2d14 100644
+--- a/src/window.h
++++ b/src/window.h
+@@ -559,6 +559,12 @@ class KWIN_EXPORT Window : public QObject
+      */
+     Q_PROPERTY(bool inputMethod READ isInputMethod)
+ 
++    /**
++     * Exclude this window from ScreenCast.
++     * It will also be applied for all transient windows recursively.
++     */
++    Q_PROPERTY(bool excludeFromCapture READ excludeFromCapture WRITE setExcludeFromCapture NOTIFY excludeFromCaptureChanged FINAL)
++
+ public:
+     ~Window() override;
+ 
+@@ -1365,6 +1371,9 @@ public:
+     const ColorDescription &preferredColorDescription() const;
+     void setPreferredColorDescription(const ColorDescription &description);
+ 
++    bool excludeFromCapture() const;
++    void setExcludeFromCapture(bool newExcludeFromCapture);
++
+ public Q_SLOTS:
+     virtual void closeWindow() = 0;
+ 
+@@ -1484,6 +1493,7 @@ Q_SIGNALS:
+     void offscreenRenderingChanged();
+     void targetScaleChanged();
+     void nextTargetScaleChanged();
++    void excludeFromCaptureChanged();
+ 
+ protected:
+     Window();
+@@ -1814,6 +1824,7 @@ protected:
+     bool m_demandsAttention = false;
+     bool m_minimized = false;
+     bool m_suspended = false;
++    bool m_excludeFromCapture = false;
+     QTimer *m_autoRaiseTimer = nullptr;
+     QTimer *m_shadeHoverTimer = nullptr;
+     ShadeMode m_shadeMode = ShadeNone;
+diff --git a/src/workspace.h b/src/workspace.h
+index cdf0248..0a0eba7 100644
+--- a/src/workspace.h
++++ b/src/workspace.h
+@@ -527,6 +527,7 @@ public Q_SLOTS:
+     void slotWindowOnAllDesktops();
+     void slotWindowFullScreen();
+     void slotWindowNoBorder();
++    void slotWindowExcludeFromCapture();
+ 
+     void slotWindowToNextDesktop();
+     void slotWindowToPreviousDesktop();
