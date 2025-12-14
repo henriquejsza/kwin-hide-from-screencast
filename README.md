@@ -16,7 +16,9 @@ Allows you to exclude specific windows from screen sharing and recording - perfe
 |-------------|--------|
 | ![More Actions Menu](screenshots/menu-more-actions.png) | ![Hide from Screencast](screenshots/hide-from-screencast-option.png) |
 
-**[🎬 Watch Demo Video](screenshots/demo.mp4)**
+### 🎬 Demo
+
+![Demo](screenshots/demo.gif)
 
 ## ✨ Features
 
