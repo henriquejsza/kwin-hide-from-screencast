@@ -1,0 +1,1066 @@
+diff --git a/src/hiddenwindowinputfilter.cpp b/src/hiddenwindowinputfilter.cpp
+new file mode 100644
+index 0000000000..13f9196ca3
+--- /dev/null
++++ b/src/hiddenwindowinputfilter.cpp
+@@ -0,0 +1,410 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-FileCopyrightText: 2025 Henrique Jose de Souza <henriquejsza@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "hiddenwindowinputfilter.h"
++#include "compositor.h"
++#include "cursor.h"
++#include "input_event.h"
++#include "pointer_input.h"
++#include "scene/workspacescene.h"
++#include "wayland/seat.h"
++#include "wayland_server.h"
++#include "window.h"
++#include "workspace.h"
++
++#include <QDebug>
++#include <linux/input-event-codes.h>
++
++namespace KWin
++{
++
++// Activation key: F12
++static const Qt::Key ACTIVATION_KEY = Qt::Key_F12;
++static const quint32 ACTIVATION_SCANCODE = KEY_F12;
++
++HiddenWindowInputFilter::HiddenWindowInputFilter()
++    : InputEventFilter(InputFilterOrder::LockScreen) // Must be before GlobalShortcut to intercept F12
++{
++}
++
++HiddenWindowInputFilter::~HiddenWindowInputFilter()
++{
++    if (m_active) {
++        deactivate();
++    }
++}
++
++void HiddenWindowInputFilter::setTargetWindow(Window *window)
++{
++    if (m_targetWindow == window) {
++        return;
++    }
++
++    if (m_active && m_targetWindow != window) {
++        deactivate();
++    }
++
++    m_targetWindow = window;
++
++    if (window) {
++        connect(window, &Window::closed, this, [this]() {
++            if (m_active) {
++                deactivate();
++            }
++            m_targetWindow = nullptr;
++        });
++    }
++}
++
++void HiddenWindowInputFilter::activate()
++{
++    if (m_active || !m_targetWindow) {
++        return;
++    }
++
++    m_active = true;
++    m_isDragging = false;
++
++    // Lock the cursor at its current position (also freezes cursor shape)
++    input()->pointer()->setInternalLocked(true);
++
++    // Store current cursor position (will appear "frozen")
++    m_frozenCursorPos = Cursors::self()->mouse()->pos();
++
++    // Initialize hidden cursor at center of target window
++    m_hiddenCursorPos = m_targetWindow->frameGeometry().center();
++
++    m_pressedButtons = Qt::NoButton;
++
++    // Hide window from dock and Alt+Tab
++    // Hide window from dock and Alt+Tab is now handled by Window::setExcludeFromCapture
++
++    qDebug() << "HiddenWindowInputFilter: Activating... Target:" << (m_targetWindow ? m_targetWindow->caption() : "None");
++
++    // Show virtual cursor at hidden position
++    if (auto scene = qobject_cast<WorkspaceScene *>(Compositor::self()->scene())) {
++        scene->showVirtualCursor(m_hiddenCursorPos);
++    }
++
++    // Establish pointer focus on the hidden window ONCE with proper transformation
++    if (waylandServer() && waylandServer()->seat()) {
++        auto surface = m_targetWindow->surface();
++        if (surface) {
++            SeatInterface *seat = waylandServer()->seat();
++            // Use the window's input transformation matrix for proper coordinate mapping
++            seat->notifyPointerEnter(surface, m_hiddenCursorPos, m_targetWindow->inputTransformation());
++            seat->notifyPointerFrame();
++        }
++    }
++
++    // Force repaint to fix blur issue when entering hidden mode
++    Compositor::self()->scene()->addRepaintFull();
++
++    qDebug() << "HiddenWindowInputFilter: Activated for window" << m_targetWindow->caption();
++    qDebug() << "HiddenWindowInputFilter: Frozen cursor at" << m_frozenCursorPos;
++    qDebug() << "HiddenWindowInputFilter: Hidden cursor at" << m_hiddenCursorPos;
++}
++
++void HiddenWindowInputFilter::deactivate()
++{
++    if (!m_active) {
++        return;
++    }
++
++    m_active = false;
++
++    // Hide virtual cursor first
++    if (auto scene = qobject_cast<WorkspaceScene *>(Compositor::self()->scene())) {
++        scene->hideVirtualCursor();
++    }
++
++    m_pressedButtons = Qt::NoButton;
++
++    // Restore window visibility in dock and Alt+Tab
++    // Window visibility restoration is handled by setExcludeFromCapture toggle
++
++    // Clear pointer focus from the hidden window
++    if (waylandServer() && waylandServer()->seat()) {
++        waylandServer()->seat()->notifyPointerLeave();
++    }
++
++    // Unlock the cursor - this allows normal input handling to resume
++    input()->pointer()->setInternalLocked(false);
++
++    // Warp pointer to the frozen position
++    input()->pointer()->warp(m_frozenCursorPos);
++
++    // FORCE Seat update to sync with reality
++    // PointerInputRedirection might silently skip the update if it thinks focus didn't change,
++    // but the Seat was manually cleared above. We must restore it manually.
++    if (waylandServer() && waylandServer()->seat()) {
++        Window *foundWindow = nullptr;
++        const auto &stacking = workspace()->stackingOrder();
++        // Iterate form top to bottom to find the top-most window under cursor
++        for (int i = stacking.count() - 1; i >= 0; --i) {
++            Window *w = stacking.at(i);
++            if (w->isDeleted() || !w->isShown()) {
++                continue;
++            }
++            if (w->frameGeometry().contains(m_frozenCursorPos)) {
++                foundWindow = w;
++                break;
++            }
++        }
++
++        if (foundWindow && foundWindow->surface()) {
++            waylandServer()->seat()->notifyPointerEnter(foundWindow->surface(), m_frozenCursorPos, foundWindow->inputTransformation());
++            waylandServer()->seat()->notifyPointerFrame();
++        }
++    }
++
++    qDebug() << "HiddenWindowInputFilter: Deactivated, warped to" << m_frozenCursorPos;
++}
++
++bool HiddenWindowInputFilter::keyboardKey(KeyboardKeyEvent *event)
++{
++    // Alt+D shortcut: GLOBAL toggle minimize/restore for hidden windows
++    // Works regardless of whether m_active is true or not!
++    if (event->key == Qt::Key_D && (event->modifiers & Qt::AltModifier) && event->state == KeyboardKeyState::Pressed) {
++
++        // Find any hidden window (including minimized ones)
++        Window *hiddenWindow = findHiddenWindow(true /* includeMinimized */);
++
++        if (hiddenWindow) {
++            if (hiddenWindow->isMinimized()) {
++                // Unminimize (restore) the window
++                hiddenWindow->setMinimized(false);
++                // FORCE activation to steal focus from other apps (like Chrome)
++                workspace()->activateWindow(hiddenWindow);
++                qDebug() << "HiddenWindowInputFilter: Alt+D - Restored and ACTIVATED hidden window";
++            } else {
++                // Minimize the window
++                hiddenWindow->setMinimized(true);
++                qDebug() << "HiddenWindowInputFilter: Alt+D - Minimized hidden window";
++            }
++            return true; // Consume the event
++        }
++    }
++
++    // Check for activation key (F12) - TOGGLE mode
++    if (event->nativeScanCode == ACTIVATION_SCANCODE || event->key == ACTIVATION_KEY) {
++        // Only react to Pressed events (ignore Repeated and Released for toggle)
++        if (event->state == KeyboardKeyState::Pressed) {
++            if (!m_active) {
++                // ACTIVATE: Find a window with excludeFromCapture enabled
++                // Now includes minimized windows - they will be restored when activated
++                if (!m_targetWindow) {
++                    Window *found = findHiddenWindow(true /* includeMinimized */);
++                    if (found) {
++                        setTargetWindow(found);
++                    }
++                }
++
++                if (m_targetWindow) {
++                    // If window is minimized, restore it first
++                    if (m_targetWindow->isMinimized()) {
++                        m_targetWindow->setMinimized(false);
++                        qDebug() << "HiddenWindowInputFilter: Restored minimized window before activation";
++                    }
++                    qDebug() << "HiddenWindowInputFilter: TOGGLE ON";
++                    activate();
++                }
++            } else {
++                // DEACTIVATE: Toggle off
++                qDebug() << "HiddenWindowInputFilter: TOGGLE OFF";
++                deactivate();
++            }
++            return true; // Consume the key event
++        }
++
++        // Consume Repeated and Released events when active (ignore them for toggle)
++        if (m_active) {
++            return true;
++        }
++    }
++
++    // When active, forward OTHER keyboard events to target window (not F12 or Alt+D)
++    if (m_active && m_targetWindow) {
++        sendKeyEventToWindow(event->nativeScanCode, event->state == KeyboardKeyState::Pressed);
++        return true; // Consume the event
++    }
++
++    return false; // Let other filters handle it
++}
++
++bool HiddenWindowInputFilter::pointerMotion(PointerMotionEvent *event)
++{
++    if (!m_active || !m_targetWindow) {
++        return false;
++    }
++
++    // Update hidden cursor position with the delta
++    m_hiddenCursorPos += event->delta;
++
++    // If dragging, move the window and update cursor position
++    if (m_isDragging) {
++        // Move window by delta
++        QPointF newPos = m_targetWindow->pos() + event->delta;
++        m_targetWindow->move(newPos);
++
++        // Update virtual cursor position to follow
++        if (auto scene = qobject_cast<WorkspaceScene *>(Compositor::self()->scene())) {
++            scene->updateVirtualCursorPosition(m_hiddenCursorPos);
++        }
++        return true;
++    }
++
++    // Clamp to window bounds (when not dragging)
++    const QRectF windowRect = m_targetWindow->frameGeometry();
++    m_hiddenCursorPos.setX(qBound(windowRect.left(), m_hiddenCursorPos.x(), windowRect.right()));
++    m_hiddenCursorPos.setY(qBound(windowRect.top(), m_hiddenCursorPos.y(), windowRect.bottom()));
++
++    // Update virtual cursor position on screen
++    if (auto scene = qobject_cast<WorkspaceScene *>(Compositor::self()->scene())) {
++        scene->updateVirtualCursorPosition(m_hiddenCursorPos);
++    }
++
++    // Send pointer motion to the hidden window (focus was established in activate())
++    if (waylandServer() && waylandServer()->seat()) {
++        SeatInterface *seat = waylandServer()->seat();
++        seat->setTimestamp(event->timestamp);
++        seat->notifyPointerMotion(m_hiddenCursorPos);
++        seat->notifyPointerFrame();
++    }
++
++    return true; // Consume the event - cursor stays frozen
++}
++
++bool HiddenWindowInputFilter::pointerButton(PointerButtonEvent *event)
++{
++    if (!m_active || !m_targetWindow) {
++        return false;
++    }
++
++    // Update button state
++    if (event->state == PointerButtonState::Pressed) {
++        m_pressedButtons |= event->button;
++
++        // Check if this is a left button press on the decoration (title bar)
++        // Decoration is the area between frame geometry and client geometry
++        if (event->button == Qt::LeftButton) {
++            const QRectF frameRect = m_targetWindow->frameGeometry();
++            const QRectF clientRect = m_targetWindow->clientGeometry();
++
++            // Check if click is in frame but not in client area (i.e., decoration)
++            if (frameRect.contains(m_hiddenCursorPos) && !clientRect.contains(m_hiddenCursorPos)) {
++                // Start window drag
++                m_isDragging = true;
++                qDebug() << "HiddenWindowInputFilter: Started window drag at" << m_hiddenCursorPos;
++                return true; // Don't send button to client, we're dragging
++            }
++        }
++    } else {
++        m_pressedButtons &= ~event->button;
++
++        // Check if this is left button release while dragging
++        if (event->button == Qt::LeftButton && m_isDragging) {
++            m_isDragging = false;
++            qDebug() << "HiddenWindowInputFilter: Ended window drag";
++            return true;
++        }
++    }
++
++    // If dragging, don't forward button events to client
++    if (m_isDragging) {
++        return true;
++    }
++
++    // Forward the button event via Wayland (focus was established in activate())
++    if (waylandServer() && waylandServer()->seat()) {
++        SeatInterface *seat = waylandServer()->seat();
++        seat->setTimestamp(event->timestamp);
++        seat->notifyPointerButton(event->nativeButton, event->state);
++        seat->notifyPointerFrame();
++    }
++
++    return true;
++}
++
++bool HiddenWindowInputFilter::pointerAxis(PointerAxisEvent *event)
++{
++    if (!m_active || !m_targetWindow) {
++        return false;
++    }
++
++    // Forward scroll to hidden window (focus was established in activate())
++    if (waylandServer() && waylandServer()->seat()) {
++        SeatInterface *seat = waylandServer()->seat();
++        seat->setTimestamp(event->timestamp);
++        seat->notifyPointerAxis(
++            event->orientation,
++            event->delta,
++            event->deltaV120,
++            event->source,
++            event->inverted);
++        seat->notifyPointerFrame();
++    }
++
++    return true;
++}
++
++// sendPointerEventToWindow is no longer needed - pointer events are sent directly
++// in the respective handler methods with proper focus management
++
++void HiddenWindowInputFilter::sendKeyEventToWindow(quint32 key, bool pressed)
++{
++    if (!m_targetWindow || !waylandServer() || !waylandServer()->seat()) {
++        return;
++    }
++
++    auto surface = m_targetWindow->surface();
++    if (!surface) {
++        return;
++    }
++
++    SeatInterface *seat = waylandServer()->seat();
++
++    // Ensure keyboard focus is on the hidden window
++    seat->setFocusedKeyboardSurface(surface);
++    // Use 0 as serial since this is a synthetic event
++    seat->notifyKeyboardKey(key, pressed ? KeyboardKeyState::Pressed : KeyboardKeyState::Released, 0);
++}
++
++Window *HiddenWindowInputFilter::findHiddenWindow(bool includeMinimized) const
++{
++    const auto windows = workspace()->windows();
++    for (Window *w : windows) {
++        // excludeFromCapture() is the primary identifier for our target window
++        if (!w->excludeFromCapture()) {
++            continue;
++        }
++
++        if (includeMinimized) {
++            // Be aggressive: if it exists and hasn't been deleted, it's our window.
++            // Even if KWin thinks it's hidden (e.g. on another desktop), we want to find it.
++            if (!w->isDeleted()) {
++                qDebug() << "HiddenWindowInputFilter: Found candidate" << w->caption()
++                         << "minimized:" << w->isMinimized()
++                         << "hidden:" << w->isHidden()
++                         << "hiddenByShowDesktop:" << w->isHiddenByShowDesktop();
++                return w;
++            }
++        } else {
++            // Original behavior: use isShown()
++            if (w->isShown()) {
++                return w;
++            }
++        }
++    }
++    return nullptr;
++}
++
++} // namespace KWin
++
++#include "moc_hiddenwindowinputfilter.cpp"
+diff --git a/src/hiddenwindowinputfilter.h b/src/hiddenwindowinputfilter.h
+new file mode 100644
+index 0000000000..3ed544f8fd
+--- /dev/null
++++ b/src/hiddenwindowinputfilter.h
+@@ -0,0 +1,71 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-FileCopyrightText: 2025 Henrique Jose de Souza <henriquejsza@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#pragma once
++
++#include "input.h"
++
++#include <QObject>
++#include <QPointF>
++
++#include <kwin_export.h>
++
++namespace KWin
++{
++
++class Window;
++
++/**
++ * @brief Input filter for interacting with hidden windows (excludeFromCapture).
++ *
++ * When activated (F12 key), this filter:
++ * - Freezes the visible cursor position
++ * - Redirects mouse/keyboard input to the hidden window
++ * - Acts as if a virtual cursor is moving inside the hidden window
++ */
++class KWIN_EXPORT HiddenWindowInputFilter : public QObject, public InputEventFilter
++{
++    Q_OBJECT
++public:
++    HiddenWindowInputFilter();
++    ~HiddenWindowInputFilter() override;
++
++    bool pointerMotion(PointerMotionEvent *event) override;
++    bool pointerButton(PointerButtonEvent *event) override;
++    bool pointerAxis(PointerAxisEvent *event) override;
++    bool keyboardKey(KeyboardKeyEvent *event) override;
++
++    bool isActive() const
++    {
++        return m_active;
++    }
++    Window *targetWindow() const
++    {
++        return m_targetWindow;
++    }
++
++public Q_SLOTS:
++    void setTargetWindow(Window *window);
++
++private:
++    void activate();
++    void deactivate();
++    void sendKeyEventToWindow(quint32 key, bool pressed);
++    Window *findHiddenWindow(bool includeMinimized = false) const;
++
++    bool m_active = false;
++    QPointF m_frozenCursorPos; // Position where cursor appears frozen
++    QPointF m_hiddenCursorPos; // Virtual cursor position in hidden window
++    Window *m_targetWindow = nullptr;
++    Qt::MouseButtons m_pressedButtons;
++    bool m_isDragging = false; // Window is being dragged
++    bool m_originalSkipTaskbar = false; // Original state to restore on deactivate
++    bool m_originalSkipSwitcher = false; // Original state to restore on deactivate
++};
++
++} // namespace KWin
+diff --git a/src/options.h b/src/options.h
+index 72cf2e3fc6..8fddc4b3ee 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -402,6 +402,7 @@ public:
+         LowerOp,
+         FullScreenOp,
+         NoBorderOp,
++        ExcludeFromCaptureOp,
+         NoOp,
+         SetupWindowShortcutOp,
+         ApplicationRulesOp,
+diff --git a/src/plugins/screencast/regionscreencastsource.cpp b/src/plugins/screencast/regionscreencastsource.cpp
+index 28bfc80683..96b5c4027a 100644
+--- a/src/plugins/screencast/regionscreencastsource.cpp
++++ b/src/plugins/screencast/regionscreencastsource.cpp
+@@ -34,6 +34,7 @@ RegionScreenCastSource::RegionScreenCastSource(const QRect &region, qreal scale,
+ {
+     m_sceneView->setViewport(m_region);
+     m_sceneView->setScale(m_scale);
++    m_sceneView->setRespectsWindowCaptureExclusion(true);
+     // prevent the layer from scheduling frames on the actual output
+     m_layer->setRenderLoop(nullptr);
+     // always hide the cursor from the primary view
+diff --git a/src/pointer_input.cpp b/src/pointer_input.cpp
+index dfa2a60ca7..0b9e18cbd7 100644
+--- a/src/pointer_input.cpp
++++ b/src/pointer_input.cpp
+@@ -698,6 +698,17 @@ void PointerInputRedirection::setEnableConstraints(bool set)
+     updatePointerConstraints();
+ }
+ 
++void PointerInputRedirection::setInternalLocked(bool locked)
++{
++    if (m_internalLocked == locked) {
++        return;
++    }
++    qDebug() << "PointerInputRedirection::setInternalLocked(" << locked << ") - was:" << m_internalLocked;
++    m_internalLocked = locked;
++    // Trigger cursor reevaluation to update cursor shape (freeze/unfreeze)
++    m_cursor->updateSource();
++}
++
+ void PointerInputRedirection::updatePointerConstraints()
+ {
+     if (!focus()) {
+@@ -914,7 +925,7 @@ QPointF PointerInputRedirection::applyEdgeBarrier(const QPointF &pos, const Outp
+ void PointerInputRedirection::updatePosition(const QPointF &pos, std::chrono::microseconds time)
+ {
+     m_lastMoveTime = time;
+-    if (m_locked) {
++    if (m_locked || m_internalLocked) {
+         // locked pointer should not move
+         return;
+     }
+@@ -1271,6 +1282,12 @@ void WaylandCursorImage::updateCursorTheme()
+ 
+ void CursorImage::reevaluteSource()
+ {
++    // When internal lock is active (hidden window mode), freeze cursor at arrow
++    // This prevents the client from changing cursor shape when virtual cursor hovers
++    if (m_pointer->isInternalLocked()) {
++        setSource(m_fallbackCursor.get());
++        return;
++    }
+     if (waylandServer()->isScreenLocked()) {
+         setSource(m_serverCursor.cursor);
+         return;
+@@ -1321,6 +1338,11 @@ CursorTheme CursorImage::theme() const
+ {
+     return m_waylandImage.theme();
+ }
++
++void CursorImage::updateSource()
++{
++    reevaluteSource();
++}
+ }
+ 
+ #include "moc_pointer_input.cpp"
+diff --git a/src/pointer_input.h b/src/pointer_input.h
+index 7bd59c54c1..cc1061bf23 100644
+--- a/src/pointer_input.h
++++ b/src/pointer_input.h
+@@ -75,9 +75,16 @@ public:
+ 
+     bool isConstrained() const
+     {
+-        return m_confined || m_locked;
++        return m_confined || m_locked || m_internalLocked;
+     }
+ 
++    /**
++     * Set internal lock state (for hidden window interaction)
++     * Unlike Wayland pointer lock, this is controlled directly by KWin
++     */
++    void setInternalLocked(bool locked);
++    bool isInternalLocked() const { return m_internalLocked; }
++
+     bool focusUpdatesBlocked() override;
+ 
+     /**
+@@ -193,6 +200,7 @@ private:
+     bool m_confined = false;
+     bool m_locked = false;
+     bool m_enableConstraints = true;
++    bool m_internalLocked = false; // For hidden window interaction
+     bool m_lastOutputWasPlaceholder = true;
+     QPointF m_movementInEdgeBarrier;
+     std::chrono::microseconds m_lastMoveTime = std::chrono::microseconds::zero();
+@@ -232,6 +240,7 @@ public:
+     CursorTheme theme() const;
+     CursorSource *source() const;
+     void setSource(CursorSource *source);
++    void updateSource(); // Re-evaluate and update cursor source
+ 
+     void updateCursorOutputs(const QPointF &pos);
+ 
+diff --git a/src/scene/item.cpp b/src/scene/item.cpp
+index 3ebf3c12f1..4f553931fe 100644
+--- a/src/scene/item.cpp
++++ b/src/scene/item.cpp
+@@ -747,6 +747,16 @@ bool Item::hasVisibleContents() const
+     });
+ }
+ 
++bool Item::excludeFromCapture() const
++{
++    return m_excludeFromCapture;
++}
++
++void Item::setExcludeFromCapture(bool exclude)
++{
++    m_excludeFromCapture = exclude;
++}
++
+ } // namespace KWin
+ 
+ #include "moc_item.cpp"
+diff --git a/src/scene/item.h b/src/scene/item.h
+index 014d11bf80..f42400c949 100644
+--- a/src/scene/item.h
++++ b/src/scene/item.h
+@@ -170,6 +170,12 @@ public:
+      */
+     bool hasVisibleContents() const;
+ 
++    /**
++     * @returns if this Item should be excluded from screen capture/recording
++     */
++    bool excludeFromCapture() const;
++    void setExcludeFromCapture(bool exclude);
++
+ Q_SIGNALS:
+     void childAdded(Item *item);
+     void childRemoved(Item *item);
+@@ -235,6 +241,7 @@ private:
+     RenderingIntent m_renderingIntent = RenderingIntent::Perceptual;
+     PresentationModeHint m_presentationHint = PresentationModeHint::VSync;
+     int m_effectCount = 0;
++    bool m_excludeFromCapture = false;
+ };
+ 
+ } // namespace KWin
+diff --git a/src/scene/scene.cpp b/src/scene/scene.cpp
+index 94fca12e33..2a4885bcf4 100644
+--- a/src/scene/scene.cpp
++++ b/src/scene/scene.cpp
+@@ -14,6 +14,8 @@
+ #include "scene/item.h"
+ #include "scene/itemrenderer.h"
+ #include "scene/surfaceitem.h"
++#include "scene/windowitem.h"
++#include "window.h"
+ 
+ namespace KWin
+ {
+@@ -189,11 +191,38 @@ void SceneView::removeUnderlay(RenderView *view)
+ 
+ bool SceneView::shouldRenderItem(Item *item) const
+ {
++    if (m_respectsWindowCaptureExclusion) {
++        // Walk up the item hierarchy to find the WindowItem ancestor
++        Item *current = item;
++        bool foundWindowItem = false;
++        while (current) {
++            if (auto windowItem = qobject_cast<WindowItem *>(current)) {
++                foundWindowItem = true;
++                if (auto window = windowItem->window()) {
++                    if (window->excludeFromCapture()) {
++                        return false;
++                    }
++                }
++                break; // Found WindowItem, no need to continue
++            }
++            current = current->parentItem();
++        }
++        // If this item is not part of any WindowItem (e.g., overlay items like virtual cursor),
++        // check the item's own excludeFromCapture property
++        if (!foundWindowItem && item->excludeFromCapture()) {
++            return false;
++        }
++    }
+     return std::ranges::none_of(m_exclusiveViews, [item](RenderView *view) {
+         return view->shouldRenderItem(item);
+     });
+ }
+ 
++void SceneView::setRespectsWindowCaptureExclusion(bool respects)
++{
++    m_respectsWindowCaptureExclusion = respects;
++}
++
+ bool SceneView::shouldRenderHole(Item *item) const
+ {
+     return std::ranges::any_of(m_underlayViews, [item](RenderView *view) {
+diff --git a/src/scene/scene.h b/src/scene/scene.h
+index 91963e8fbb..afb332476b 100644
+--- a/src/scene/scene.h
++++ b/src/scene/scene.h
+@@ -102,6 +102,8 @@ public:
+     bool shouldRenderItem(Item *item) const override;
+     bool shouldRenderHole(Item *item) const override;
+ 
++    void setRespectsWindowCaptureExclusion(bool respects);
++
+ private:
+     Scene *m_scene;
+     Output *m_output = nullptr;
+@@ -110,6 +112,7 @@ private:
+     qreal m_scale = 1.0;
+     QList<RenderView *> m_exclusiveViews;
+     QList<RenderView *> m_underlayViews;
++    bool m_respectsWindowCaptureExclusion = false;
+ };
+ 
+ class KWIN_EXPORT ItemView : public RenderView
+diff --git a/src/scene/workspacescene.cpp b/src/scene/workspacescene.cpp
+index db7488b474..84fe3cf2a7 100644
+--- a/src/scene/workspacescene.cpp
++++ b/src/scene/workspacescene.cpp
+@@ -156,6 +156,33 @@ Item *WorkspaceScene::cursorItem() const
+     return m_cursorItem.get();
+ }
+ 
++void WorkspaceScene::showVirtualCursor(const QPointF &pos)
++{
++    if (!m_virtualCursorItem) {
++        m_virtualCursorItem = std::make_unique<CursorItem>(m_overlayItem.get());
++        m_virtualCursorItem->setZ(2); // Above normal cursor
++        m_virtualCursorItem->setExcludeFromCapture(true); // Hide from screen recordings
++    }
++    m_virtualCursorItem->setPosition(pos);
++    m_virtualCursorItem->setVisible(true);
++    qDebug() << "WorkspaceScene: Virtual cursor shown at" << pos;
++}
++
++void WorkspaceScene::hideVirtualCursor()
++{
++    if (m_virtualCursorItem) {
++        m_virtualCursorItem->setVisible(false);
++        qDebug() << "WorkspaceScene: Virtual cursor hidden";
++    }
++}
++
++void WorkspaceScene::updateVirtualCursorPosition(const QPointF &pos)
++{
++    if (m_virtualCursorItem && m_virtualCursorItem->isVisible()) {
++        m_virtualCursorItem->setPosition(pos);
++    }
++}
++
+ static bool regionActuallyContains(const QRegion &region, const QRect &rect)
+ {
+     // QRegion::contains does **not** actually check if the region contains the rect
+@@ -509,6 +536,11 @@ static void accumulateRepaints(Item *item, SceneView *delegate, QRegion *repaint
+ void WorkspaceScene::preparePaintGenericScreen()
+ {
+     for (WindowItem *windowItem : std::as_const(stacking_order)) {
++        // Skip windows that should not be rendered for this delegate (e.g., excludeFromCapture)
++        if (!painted_delegate->shouldRenderItem(windowItem)) {
++            continue;
++        }
++
+         resetRepaintsHelper(windowItem, painted_delegate);
+ 
+         WindowPrePaintData data;
+@@ -528,6 +560,11 @@ void WorkspaceScene::preparePaintGenericScreen()
+ void WorkspaceScene::preparePaintSimpleScreen()
+ {
+     for (WindowItem *windowItem : std::as_const(stacking_order)) {
++        // Skip windows that should not be rendered for this delegate (e.g., excludeFromCapture)
++        if (!painted_delegate->shouldRenderItem(windowItem)) {
++            continue;
++        }
++
+         Window *window = windowItem->window();
+         WindowPrePaintData data;
+         data.mask = m_paintContext.mask;
+diff --git a/src/scene/workspacescene.h b/src/scene/workspacescene.h
+index b57fc9621e..7d55af5c10 100644
+--- a/src/scene/workspacescene.h
++++ b/src/scene/workspacescene.h
+@@ -37,6 +37,11 @@ public:
+     Item *containerItem() const;
+     Item *overlayItem() const;
+     Item *cursorItem() const;
++    
++    // Virtual cursor for hidden window interaction
++    void showVirtualCursor(const QPointF &pos);
++    void hideVirtualCursor();
++    void updateVirtualCursorPosition(const QPointF &pos);
+ 
+     QList<SurfaceItem *> scanoutCandidates(ssize_t maxCount) const override;
+     OverlayCandidates overlayCandidates(ssize_t maxTotalCount, ssize_t maxOverlayCount, ssize_t maxUnderlayCount) const override;
+@@ -117,6 +122,7 @@ private:
+     std::unique_ptr<Item> m_overlayItem;
+     std::unique_ptr<DragAndDropIconItem> m_dndIcon;
+     std::unique_ptr<CursorItem> m_cursorItem;
++    std::unique_ptr<CursorItem> m_virtualCursorItem; // For hidden window interaction
+ };
+ 
+ } // namespace
+diff --git a/src/scripting/workspace_wrapper.cpp b/src/scripting/workspace_wrapper.cpp
+index 1d26fd2a45..f4909464c3 100644
+--- a/src/scripting/workspace_wrapper.cpp
++++ b/src/scripting/workspace_wrapper.cpp
+@@ -159,6 +159,7 @@ SLOTWRAPPER(slotWindowBelow)
+ SLOTWRAPPER(slotWindowOnAllDesktops)
+ SLOTWRAPPER(slotWindowFullScreen)
+ SLOTWRAPPER(slotWindowNoBorder)
++SLOTWRAPPER(slotWindowExcludeFromCapture)
+ 
+ SLOTWRAPPER(slotWindowToNextDesktop)
+ SLOTWRAPPER(slotWindowToPreviousDesktop)
+diff --git a/src/scripting/workspace_wrapper.h b/src/scripting/workspace_wrapper.h
+index ec12bc6b41..86d46e3ed3 100644
+--- a/src/scripting/workspace_wrapper.h
++++ b/src/scripting/workspace_wrapper.h
+@@ -403,6 +403,7 @@ public Q_SLOTS:
+     void slotWindowOnAllDesktops();
+     void slotWindowFullScreen();
+     void slotWindowNoBorder();
++    void slotWindowExcludeFromCapture();
+ 
+     void slotWindowToNextDesktop();
+     void slotWindowToPreviousDesktop();
+diff --git a/src/useractions.cpp b/src/useractions.cpp
+index 143ff59845..ef7ed45882 100644
+--- a/src/useractions.cpp
++++ b/src/useractions.cpp
+@@ -84,6 +84,7 @@ UserActionsMenu::UserActionsMenu(QObject *parent)
+     , m_keepBelowOperation(nullptr)
+     , m_fullScreenOperation(nullptr)
+     , m_noBorderOperation(nullptr)
++    , m_excludeFromCaptureOperation(nullptr)
+     , m_minimizeOperation(nullptr)
+     , m_closeOperation(nullptr)
+     , m_shortcutOperation(nullptr)
+@@ -247,6 +248,12 @@ void UserActionsMenu::init()
+     m_noBorderOperation->setCheckable(true);
+     m_noBorderOperation->setData(Options::NoBorderOp);
+ 
++    m_excludeFromCaptureOperation = advancedMenu->addAction(i18n("&Hide from Screencast"));
++    m_excludeFromCaptureOperation->setIcon(QIcon::fromTheme(QStringLiteral("view-private")));
++    setShortcut(m_excludeFromCaptureOperation, QStringLiteral("Window Exclude From Capture"));
++    m_excludeFromCaptureOperation->setCheckable(true);
++    m_excludeFromCaptureOperation->setData(Options::ExcludeFromCaptureOp);
++
+     advancedMenu->addSeparator();
+ 
+     m_shortcutOperation = advancedMenu->addAction(i18n("Set Window Short&cut…"));
+@@ -331,6 +338,7 @@ void UserActionsMenu::menuAboutToShow()
+     m_fullScreenOperation->setChecked(m_window->isFullScreen());
+     m_noBorderOperation->setEnabled(m_window->userCanSetNoBorder());
+     m_noBorderOperation->setChecked(m_window->noBorder());
++    m_excludeFromCaptureOperation->setChecked(m_window->excludeFromCapture());
+     m_minimizeOperation->setEnabled(m_window->isMinimizable());
+     m_closeOperation->setEnabled(m_window->isCloseable());
+     m_shortcutOperation->setEnabled(m_window->rules()->checkShortcut(QString()).isNull());
+@@ -1114,6 +1122,9 @@ void Workspace::performWindowOperation(Window *window, Options::WindowOperation
+             window->setNoBorder(!window->noBorder());
+         }
+         break;
++    case Options::ExcludeFromCaptureOp:
++        window->setExcludeFromCapture(!window->excludeFromCapture());
++        break;
+     case Options::KeepAboveOp: {
+         StackingUpdatesBlocker blocker(this);
+         bool was = window->keepAbove();
+@@ -1353,6 +1364,13 @@ void Workspace::slotWindowNoBorder()
+     }
+ }
+ 
++void Workspace::slotWindowExcludeFromCapture()
++{
++    if (USABLE_ACTIVE_WINDOW) {
++        performWindowOperation(m_activeWindow, Options::ExcludeFromCaptureOp);
++    }
++}
++
+ void Workspace::slotWindowAbove()
+ {
+     if (USABLE_ACTIVE_WINDOW) {
+diff --git a/src/useractions.h b/src/useractions.h
+index 1f4f3f72a9..d7dc7fad2d 100644
+--- a/src/useractions.h
++++ b/src/useractions.h
+@@ -195,6 +195,7 @@ private:
+     QAction *m_keepBelowOperation;
+     QAction *m_fullScreenOperation;
+     QAction *m_noBorderOperation;
++    QAction *m_excludeFromCaptureOperation;
+     QAction *m_minimizeOperation;
+     QAction *m_closeOperation;
+     QAction *m_shortcutOperation;
+diff --git a/src/window.cpp b/src/window.cpp
+index c4dd92c06f..07d5e4f9a6 100644
+--- a/src/window.cpp
++++ b/src/window.cpp
+@@ -817,8 +817,8 @@ QStringList Window::desktopIds() const
+     std::transform(desks.constBegin(), desks.constEnd(),
+                    std::back_inserter(ids),
+                    [](const VirtualDesktop *vd) {
+-                       return vd->id();
+-                   });
++        return vd->id();
++    });
+     return ids;
+ }
+ 
+@@ -2194,6 +2194,9 @@ void Window::setTransientFor(Window *transientFor)
+         return;
+     }
+     m_transientFor = transientFor;
++    if (m_transientFor) {
++        setExcludeFromCapture(m_transientFor->excludeFromCapture());
++    }
+     Q_EMIT transientChanged();
+ }
+ 
+@@ -4690,6 +4693,37 @@ QString Window::activationToken() const
+     return m_activationToken;
+ }
+ 
++bool Window::excludeFromCapture() const
++{
++    return m_excludeFromCapture;
++}
++
++void Window::setExcludeFromCapture(bool newExcludeFromCapture)
++{
++    if (m_excludeFromCapture == newExcludeFromCapture) {
++        return;
++    }
++
++    m_excludeFromCapture = newExcludeFromCapture;
++
++    // Force hidden windows to skip taskbar and switcher permanently
++    if (m_excludeFromCapture) {
++        setSkipTaskbar(true);
++        setSkipSwitcher(true);
++    } else {
++        // Restore visibility in dock/switcher when no longer hidden
++        // Assuming normal windows want to be seen
++        setSkipTaskbar(false);
++        setSkipSwitcher(false);
++    }
++
++    for (auto window : std::as_const(m_transients)) {
++        window->setExcludeFromCapture(newExcludeFromCapture);
++    }
++
++    Q_EMIT excludeFromCaptureChanged();
++}
++
+ } // namespace KWin
+ 
+ #include "moc_window.cpp"
+diff --git a/src/window.h b/src/window.h
+index 2b11fa365c..6b11bd3ee9 100644
+--- a/src/window.h
++++ b/src/window.h
+@@ -571,6 +571,12 @@ class KWIN_EXPORT Window : public QObject
+      */
+     Q_PROPERTY(QString description READ description NOTIFY descriptionChanged)
+ 
++    /**
++     * Exclude this window from ScreenCast.
++     * It will also be applied for all transient windows recursively.
++     */
++    Q_PROPERTY(bool excludeFromCapture READ excludeFromCapture WRITE setExcludeFromCapture NOTIFY excludeFromCaptureChanged FINAL)
++
+ public:
+     ~Window() override;
+ 
+@@ -1362,6 +1368,9 @@ public:
+     void setActivationToken(const QString &token);
+     QString activationToken() const;
+ 
++    bool excludeFromCapture() const;
++    void setExcludeFromCapture(bool newExcludeFromCapture);
++
+ public Q_SLOTS:
+     virtual void closeWindow() = 0;
+ 
+@@ -1483,6 +1492,7 @@ Q_SIGNALS:
+     void tagChanged();
+     void descriptionChanged();
+     void borderRadiusChanged();
++    void excludeFromCaptureChanged();
+ 
+ protected:
+     Window();
+@@ -1806,6 +1816,7 @@ protected:
+     bool m_demandsAttention = false;
+     bool m_minimized = false;
+     bool m_suspended = false;
++    bool m_excludeFromCapture = false;
+     QTimer *m_autoRaiseTimer = nullptr;
+     QList<VirtualDesktop *> m_desktops;
+ 
+diff --git a/src/workspace.cpp b/src/workspace.cpp
+index 17ce1e9f80..2f744af567 100644
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -44,6 +44,7 @@
+ #include "compositor.h"
+ #include "decorations/decorationbridge.h"
+ #include "dpmsinputeventfilter.h"
++#include "hiddenwindowinputfilter.h"
+ #include "lidswitchtracker.h"
+ #include "main.h"
+ #include "opengl/eglcontext.h"
+@@ -168,6 +169,10 @@ Workspace::Workspace()
+ 
+     initShortcuts();
+ 
++    // Initialize hidden window input filter for secret interactions
++    m_hiddenWindowFilter = std::make_unique<HiddenWindowInputFilter>();
++    input()->installInputEventFilter(m_hiddenWindowFilter.get());
++
+     init();
+ }
+ 
+diff --git a/src/workspace.h b/src/workspace.h
+index 3cb421b1a6..2051409c95 100644
+--- a/src/workspace.h
++++ b/src/workspace.h
+@@ -82,6 +82,7 @@ class TileManager;
+ class OutputConfigurationStore;
+ class LidSwitchTracker;
+ class DpmsInputEventFilter;
++class HiddenWindowInputFilter;
+ class OrientationSensor;
+ class BrightnessDevice;
+ 
+@@ -497,6 +498,7 @@ public Q_SLOTS:
+     void slotWindowOnAllDesktops();
+     void slotWindowFullScreen();
+     void slotWindowNoBorder();
++    void slotWindowExcludeFromCapture();
+ 
+     void slotWindowToNextDesktop();
+     void slotWindowToPreviousDesktop();
+@@ -733,6 +735,7 @@ private:
+     std::unique_ptr<LidSwitchTracker> m_lidSwitchTracker;
+     std::unique_ptr<OrientationSensor> m_orientationSensor;
+     std::unique_ptr<DpmsInputEventFilter> m_dpmsFilter;
++    std::unique_ptr<HiddenWindowInputFilter> m_hiddenWindowFilter;
+     KConfigWatcher::Ptr m_kdeglobalsWatcher;
+ 
+     QString m_activationToken;
