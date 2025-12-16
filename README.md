@@ -6,6 +6,10 @@
 
 This patch adds a "Hidden Window Mode" to KWin, allowing you to control windows that are excluded from screen capture (screencasts) while interacting with them normally using a virtual cursor.
 
+> [!NOTE]
+> **Ethical Use & Purpose:**
+> This tool is designed to enhance privacy and security during presentations by allowing users to check confidential information (e.g., password managers, private notes) without exposing sensitive data in a screen share. It is **not** intended for deceptive practices in professional environments. Please use responsibly.
+
 ## Features
 
 - **Hidden Interaction**: Interact with windows that are invisible to screen recorders (using `excludeFromCapture`).
