@@ -16,7 +16,8 @@ This patch adds a "Hidden Window Mode" to KWin, allowing you to control windows 
 - **Input Redirection**: Press `F12` to freeze your visible cursor and spawn a "virtual cursor" inside the hidden window.
 - **Virtual Cursor**: A software-rendered cursor appears within the hidden window, allowing you to click, type, and scroll without the real cursor moving on the recording.
 - **Window Management**:
-  - `Alt+D`: Global shortcut to toggle minimize/restore for the hidden window.
+  - `Alt+D`: **Global shortcut** to toggle minimize/restore for the hidden window (works even when not in hidden mode).
+  - **Stealth**: Windows marked as hidden are automatically removed from the Task Manager (Dock) and Alt+Tab switcher to prevent accidental exposure.
   - Move the hidden window by dragging its title bar while in hidden mode.
 
 ## Installation
